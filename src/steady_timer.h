@@ -14,6 +14,8 @@
 #include <ppl.h>
 #include <ppltasks.h>
 
+#include "log.h"
+
 
 //	SteadyTimer callback, false 를 리턴하면 타이머를 중지
 typedef boost::function<bool(DWORD_PTR tag)> SteadyTimerCallback;
@@ -95,7 +97,7 @@ private:
 			//	callback 호출
 			//
 			_ASSERTE(true == _running);
-			_ASSERTE(nullptr != _callback);
+			_ASSERTE(true != _callback.empty());
 			if (true != _callback(_tag))
 			{
 				//

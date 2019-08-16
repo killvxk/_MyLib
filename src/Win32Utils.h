@@ -11,31 +11,23 @@
 #ifndef _win32_utils_
 #define _win32_utils_
 
-#include <inttypes.h>
-#include "boost/algorithm/string.hpp"	// to_uppper, to_lower
-
 #include <conio.h>
-#include <winioctl.h>
-#include <winsvc.h>
-
-//> reported as vs 2010 bug, ms says that will be patch this bug next major vs release, vs2012.
-//
-//1>C:\Program Files (x86)\Microsoft SDKs\Windows\v7.0A\include\intsafe.h(171): warning C4005: 'INT16_MAX' : macro redefinition
-//1>          C:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\include\stdint.h(77) : see previous definition of 'INT16_MAX'
-#pragma warning(disable:4005)
-#include <intsafe.h>
-#pragma warning(default:4005)
-
+#include "BaseWindowsHeader.h"
+#include "boost/algorithm/string.hpp"	// to_uppper, to_lower
 #include "log.h"
+
+//
+//  _pointer 가 _alignment 바운더리에 있는지 확인 (fltKernel.h 에 정의되어있음)
+//	
+#define IS_ALIGNED(_pointer, _alignment) \
+	((((ULONG_PTR) (_pointer)) & ((_alignment) - 1)) == 0)
 
 
 // | size | _______data_______ | 형태의 메모리 구조
-// byte align 때문에 일부러 buf[4] 로 선언함
-// 
 typedef struct _continuous_memory
 {
     DWORD   size;   // buf size
-    CHAR    buf[4];
+    CHAR    buf[1];
 } CTM, *PCTM;
 #define CTM_SIZE( _data_size_ )   ((_data_size_) + sizeof(DWORD))
 
@@ -100,19 +92,18 @@ typedef struct _continuous_memory
 
 #define free_and_nil(p)	do{if (nullptr != p) { free(p); p = nullptr;} } while(false);
 
-#define     _pause  _getch()
+#define _pause  _getch()
 
 #define _mem_check_begin \
-	{\
-		_CrtMemState memoryState = { 0 }; \
-		_CrtMemCheckpoint(&memoryState)
+	_CrtMemState memoryState = { 0 }; \
+	_CrtMemCheckpoint(&memoryState); 
 
 #define _mem_check_break(ord) \
-	_CrtSetBreakAlloc(ord)
+	_CrtSetBreakAlloc(ord);
 
 #define _mem_check_end \
-		_CrtMemDumpAllObjectsSince(&memoryState); \
-	}
+	_CrtMemDumpAllObjectsSince(&memoryState)
+
 
 /* 
 	x64 에서는 inline asm 을 사용할 수 없으므로 호환성을 위해 제거
@@ -166,8 +157,9 @@ typedef struct _FATTIME
 
 std::string FAT2Str(IN FATTIME& fat);
 
-uint64_t file_time_to_int(_In_ const PFILETIME file_time);
-void int_to_file_time(_In_ uint64_t file_time_int, _Out_ PFILETIME const file_time);
+__inline uint64_t file_time_to_int(_In_ const PFILETIME file_time);
+__inline void int_to_file_time(_In_ uint64_t file_time_int, _Out_ PFILETIME const file_time);
+__inline void large_int_to_file_time(_In_ const PLARGE_INTEGER large_int, _Out_ PFILETIME const file_time);
 
 void unixtime_to_filetime(_In_ uint32_t unix_time, _Out_ PFILETIME const file_time);
 
@@ -249,7 +241,6 @@ bool get_file_position(_In_ HANDLE file_handle, _Out_ int64_t& position);
 bool set_file_position(_In_ HANDLE file_handle, _In_ int64_t distance, _Out_opt_ int64_t* new_position);
 bool set_file_size(_In_ HANDLE file_handle, _In_ int64_t new_size);
 
-
 BOOL SaveToFileAsUTF8A(
                 IN LPCWSTR FilePathDoesNotExists, 
                 IN LPCSTR NullTerminatedAsciiString
@@ -264,6 +255,7 @@ LoadFileToMemory(
 	_Out_ DWORD&  MemorySize,
 	_Outptr_ PBYTE&  Memory
 	);
+
 bool
 SaveBinaryFile(
 	_In_ const LPCWSTR  Directory,
@@ -272,16 +264,31 @@ SaveBinaryFile(
 	_In_ PBYTE    Data
 	);
 
+bool 
+get_file_hash_by_filepath(
+	_In_ const wchar_t* file_path,
+	_Out_opt_ const std::string* md5,
+	_Out_opt_ const std::string* sha2
+);
+
+bool 
+get_file_hash_by_filehandle(
+	_In_ HANDLE file_handle,
+	_Out_opt_ const std::string* md5,
+	_Out_opt_ const std::string* sha2
+);
+
+
 /// 콜백 대신 람다를 사용할 수 있음
 //	if (true != find_files(root,
-//						   [](_In_ DWORD_PTR tag, _In_ const wchar_t* path)->bool
-//   					   {
+//							(DWORD_PTR)&file_list,
+//							true, 
+//						    [](_In_ DWORD_PTR tag, _In_ const wchar_t* path)->bool
+//   					    {
 //						       std::list<std::wstring>* files = (std::list<std::wstring>*)(tag);
 //							   files->push_back(path);
 //							   return true;
-//							},
-//							(DWORD_PTR)&file_list,
-//							true))
+//							}))
 //	{
 //		// error
 //	}
@@ -290,14 +297,16 @@ SaveBinaryFile(
 //		// success
 //	}
 //
-typedef bool (WINAPI *fnFindFilesCallback)(_In_ DWORD_PTR tag, _In_ const wchar_t* path);
+typedef boost::function<
+	bool (_In_ DWORD_PTR tag, _In_ const wchar_t* path)
+> fnFindFilesCallback;
 
 bool
 find_files(
-	_In_ const wchar_t* root, 
-	_In_ fnFindFilesCallback cb, 
+	_In_ const wchar_t* root, 	
 	_In_ DWORD_PTR tag, 
-	_In_ bool recursive = true
+	_In_ bool recursive, 
+	_In_ fnFindFilesCallback cb
 	);
 
 BOOL 
@@ -409,6 +418,9 @@ bool rstrnicmp(_In_ const wchar_t* src, _In_ const wchar_t* fnd, _In_ bool case_
 bool rstrnicmpa(_In_ const char* src, _In_ const char* fnd, _In_ bool case_insensitive = true);
 bool lstrnicmp(_In_ const wchar_t* src, _In_ const wchar_t* fnd, _In_ bool case_insensitive = true);
 bool lstrnicmpa(_In_ const char* src, _In_ const char* fnd, _In_ bool case_insensitive = true);
+
+/// 두 문자열이 완전히 일치하는지 확인한다. 
+bool is_same_string(_In_ const wchar_t* lhs, _In_ const wchar_t* rhs, _In_ bool case_insensitive = true);
 
 inline void clear_str_stream_w(std::wstringstream& stream)
 {
@@ -604,7 +616,9 @@ DWORD	get_active_console_session_id();
 bool	get_session_id_by_pid(_In_ DWORD process_id, _Out_ DWORD& session_id);
 bool	process_in_console_session(_In_ DWORD process_id);
 
-bool	create_process_as_login_user(_In_ uint32_t session_id, _In_ const wchar_t* cmdline, _Out_ PROCESS_INFORMATION& pi);
+bool create_process(_In_ const wchar_t* cmdline, _In_ DWORD creation_flag, _In_opt_z_ const wchar_t* current_dir, _Out_opt_ HANDLE& process_handle, _Out_opt_ DWORD& process_id);
+bool create_process_and_wait(_In_ const wchar_t* cmdline, _In_ DWORD creation_flag, _In_opt_z_ const wchar_t* current_dir, _In_ DWORD timeout_secs, _Out_ DWORD& exit_code);
+bool create_process_as_login_user(_In_ uint32_t session_id, _In_ const wchar_t* cmdline, _Out_ PROCESS_INFORMATION& pi);
 
 bool set_security_attributes_type1(_Out_ SECURITY_ATTRIBUTES& sa);
 bool set_security_attributes_type2(_Out_ SECURITY_ATTRIBUTES& sa);
@@ -627,8 +641,6 @@ void dump_file_create_options(_In_ uint32_t NtCreateFile_CreateOptions);
 void dump_group_attributes(_In_ uint32_t group_attributes);
 /// @brief process privilege 정보 중 `attributes`을 문자열로 덤프한다.
 void dump_privilege_attributes(_In_ uint32_t privilege_attributes);
-
-#pragma todo("sid 관련코드-> windows_security.h 같은 거 하나 만들어서 이동시키자")
 
 /// @brief	user/group 정보
 ///			sid		S-1-5-18, S-1-5-21-2224222141-402476733-2427282895-1001 등
@@ -888,16 +900,14 @@ void clear_console();
     c:\windows\system32\services.exe= IMAGE_SUBSYSTEM_WINDOWS_GUI 
     
 */
-typedef enum _IMAGE_TYPE 
-{
-    IT_DLL,                     // dll, ocx file    
-    IT_EXE_GUI,                 // gui app
-    IT_EXE_CUI,                 // cui app
-	IT_EXE_BOOT,				// boot app
-    IT_NATIVE_APP,              // ntoskrnl.exe, win32k.sys, csrss.exe
-    IT_UNKNOWN                  // unknown or not executable or invalid image
-} IMAGE_TYPE;
+#define IT_UNKNOWN	0		// unknown or not executable or invalid image
+#define IT_DLL		1		// dll, ocx file    
+#define IT_EXE_GUI	2		// gui app
+#define IT_EXE_CUI	3		// cui app
+#define IT_EXE_BOOT	4		// boot app
+#define IT_NATIVE_APP	5	// ntoskrnl.exe, win32k.sys, csrss.exe
 
+typedef uint32_t IMAGE_TYPE;
 IMAGE_TYPE get_image_type(_In_ const wchar_t* path);
 IMAGE_TYPE get_image_type(_In_ HANDLE file_handle);
 LPCWSTR  image_type_to_string(IMAGE_TYPE type);
@@ -955,9 +965,30 @@ bool wstr_to_uint32(_In_ const wchar_t* uint32_string, _Out_ uint32_t& uint32_va
 bool wstr_to_int64(_In_ const wchar_t* int64_string, _Out_ int64_t& int64_val);
 bool wstr_to_uint64(_In_ const wchar_t* uint64_string, _Out_ uint64_t& uint64_val);
 
-uint16_t swap_endian_16(_In_ uint16_t value);
-uint32_t swap_endian_32(_In_ uint32_t value);
-uint64_t swap_endian_64(_In_ uint64_t value);
+inline uint16_t swap_endian_16(_In_ uint16_t value)
+{
+	return (value >> 8) | (value << 8);
+}
+
+inline uint32_t swap_endian_32(_In_ uint32_t value)
+{
+	return	(value >> 24) |
+		((value << 8) & 0x00FF0000) |
+		((value >> 8) & 0x0000FF00) |
+		(value << 24);
+}
+
+inline uint64_t swap_endian_64(_In_ uint64_t value)
+{
+	return  (value >> 56) |
+		((value << 40) & 0x00FF000000000000) |
+		((value << 24) & 0x0000FF0000000000) |
+		((value << 8) & 0x000000FF00000000) |
+		((value >> 8) & 0x00000000FF000000) |
+		((value >> 24) & 0x0000000000FF0000) |
+		((value >> 40) & 0x000000000000FF00) |
+		(value << 56);
+}
 
 typedef struct WU_PROCESSOR_INFO
 {
@@ -977,17 +1008,16 @@ BOOL WUGetProcessorInfo(IN OUT WU_PROCESSOR_INFO& CpuInfo);
 //
 // os version
 // 
-// widows 10 에서 (MDSN 에서 하라는대로) VersionHelpers.h 에 있는 IsWindows10OrGreater() 함수를 
-// 호출해도 false 가 떨어짐
+// widows 10 에서 (MDSN 에서 하라는대로) VersionHelpers.h 에 있는 
+// IsWindows10OrGreater() 함수를 호출해도 false 가 떨어짐
 // 괜히 쓰기도 복잡하고, 효율도 떨어져서 RtlGetVersion() wrapper 를 사용함
 // 
 // from https://indidev.net/forum/viewtopic.php?f=5&t=474 
 // 
-
 enum OSVER
 {
     // Operating System Version 
-    //  https://msdn.microsoft.com/en-us/library/windows/desktop/ms724832(v=vs.85).aspx
+    // https://docs.microsoft.com/ko-kr/windows-hardware/drivers/ddi/content/wdm/ns-wdm-_osversioninfoexw
 
     OSV_UNDEF,
     OSV_2000,

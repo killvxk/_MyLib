@@ -7,20 +7,10 @@
  * @copyright All rights reserved by Yonghwan, Roh.
 **/
 #include "stdafx.h"
+#include "BaseWindowsHeader.h"
 
-//	
-//	std
-//
-#include <stdio.h>
-#include <tchar.h>
 #include <random>
 
-#include "Win32Utils.h"
-#include "RegistryUtil.h"
-#include "Wow64Util.h"
-#include <Strsafe.h>
-
-#include <set>
 #include <errno.h>
 #include <io.h>			// _setmode()
 #include <fcntl.h>		// _O_U8TEXT, ...
@@ -29,13 +19,14 @@
 #include <Shellapi.h>
 #include <Shlobj.h>
 #include <Psapi.h>
-#include <guiddef.h>
 #include <sddl.h>
-
-#include "ResourceHelper.h"
-#include "gpt_partition_guid.h"
-
 #include <Objbase.h>	// CoCreateGuid()
+
+#include <TLHELP32.H>
+#include <userenv.h>
+#include <Wtsapi32.h>
+#pragma comment (lib, "userenv.lib")
+#pragma comment (lib, "Wtsapi32.lib")
 
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -43,15 +34,17 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "User32.lib")
 
-//
-//	create_process_as_login_user()
-// 
-#include <TLHELP32.H>
-#include <userenv.h>
-#pragma comment (lib, "userenv.lib")
-#include <Wtsapi32.h>
-#pragma comment (lib, "Wtsapi32.lib")
+#include "Win32Utils.h"
+#include "RegistryUtil.h"
+#include "Wow64Util.h"
+
+#include "md5.h"
+#include "sha2.h"
+#include "FileIoHelperClass.h"
+#include "ResourceHelper.h"
+#include "gpt_partition_guid.h"
 
 
 char _int_to_char_table[] = {
@@ -98,15 +91,96 @@ std::string FAT2Str(IN FATTIME& fat)
 /// @brief	FILETIME -> uint64_t
 ///	@remark	Do not cast a pointer to a FILETIME structure to either a ULARGE_INTEGER* or __int64*
 ///			https://msdn.microsoft.com/en-us/library/ms724284(VS.85).aspx
+///			https://devblogs.microsoft.com/oldnewthing/20040825-00/?p=38053
+/*
+	
+		typedef struct _FILETIME {
+			DWORD dwLowDateTime;
+			DWORD dwHighDateTime;
+		} FILETIME, *PFILETIME, *LPFILETIME;
 
-uint64_t file_time_to_int(_In_ const PFILETIME file_time)
+	FILETIME 구조체는 4바이트 변수 2개로 구성되어 있으므로 4 byte alignment 되어야 한다.
+	이 경우 FILETIME -> __int64 로 변환해도 문제가 발생하지는 않는다.
+
+	+----------------------------------------------------------------------------+
+
+	typedef struct _WIN32_FIND_DATAW {
+		DWORD dwFileAttributes;
+		FILETIME ftCreationTime;
+		FILETIME ftLastAccessTime;
+		FILETIME ftLastWriteTime;
+		DWORD nFileSizeHigh;
+		DWORD nFileSizeLow;
+		...
+	} WIN32_FIND_DATAW, *PWIN32_FIND_DATAW, *LPWIN32_FIND_DATAW;
+
+	WIN32_FIND_DATAW 구조체의 경우 dwFileAttributes 가 4바이트이므로, 
+		- ftCreationTime   = 0x00000004 ~ 0x0000000C 
+		- ftLastAccessTime = 0x0000000c ~ 0x00000020 
+	에 위치하게 된다. 
+
+	포인터 변수는 pointer alignment(8바이트)가 되어야 하는데, 만일 ftCreationTime 의 
+	주소(0x00000004)를 __int64_t* 타입의 포인터로 캐스팅해서 엑세스하게 되는 경우 
+	__int64_t 포인터는 pointer alignment(8바이트)가 아니라 4 byte alignment 메모리 영역에
+	접근하게 되기 때문에 alignment 를 지켜야 하는 경우 에러가 발생할 수 있다. 
+
+	커널의 메세지 디스패처에는 아래와 같은 코드들을 자주 볼 수 있다. 
+
+		if (!IS_ALIGNED(OutputBuffer, sizeof(uint64_t*))) {
+			return STATUS_DATATYPE_MISALIGNMENT;
+		}
+
+	만일 ftCreateTime 을 __uint64_t* 로 강제캐스팅해서 커널서비스 루틴을 호출했다면 
+	STATUS_DATATYPE_MISALIGNMENT 에러가 리턴될 것이다. 
+
+	+----------------------------------------------------------------------------+
+
+		typedef union _LARGE_INTEGER 
+		{
+			struct {
+				DWORD LowPart;
+				LONG HighPart;
+			} DUMMYSTRUCTNAME;
+
+			struct {
+				DWORD LowPart;
+				LONG HighPart;
+			} u;
+
+			LONGLONG QuadPart;
+		} LARGE_INTEGER;
+
+	LARGE_INTEGER, ULARGE_INTEGER 는 union 으로 정의되어있고 LONGLONG 타입 변수가 있기때문에
+	기본으로 8byte align 을 사용하기 때문에 위의 문제가 발생하지 않는다. 
+
+	참고로 LowPart, HighPart 를 가지는 동일한 구조체를 union 안에 두번 선언한 이유는 예전 코드와의 
+	호환성을 위한 것이라고 함 (이름 없는 구조체를 가지는 유니온을 지원하느냐 마는냐 뭐 그런...)
+	저렇게 유니온을 선언해 두면 아래 두가지 형태의 코드를 모두 사용할 수 있기 때문이라고 함
+	
+		LargeInteger.u.Lowpart = 0
+		LargeInteger.LowPart = 0 		
+*/
+__inline 
+uint64_t
+file_time_to_int(
+	_In_ const PFILETIME file_time
+)
 {
-	return ((LARGE_INTEGER*)file_time)->QuadPart;
+	_ASSERTE(nullptr != file_time);
+	if (nullptr == file_time) { return (uint64_t)(-1); }
+
+	LARGE_INTEGER li;
+	li.LowPart = file_time->dwLowDateTime;
+	li.HighPart = file_time->dwHighDateTime;
+	return li.QuadPart;
 }
 
 /// @brief	uint64_t -> FILETIME
 ///	@remark	Do not cast a pointer to a FILETIME structure to either a ULARGE_INTEGER* or __int64*
 ///			https://msdn.microsoft.com/en-us/library/ms724284(VS.85).aspx
+///			https://devblogs.microsoft.com/oldnewthing/20040825-00/?p=38053
+///	
+__inline 
 void
 int_to_file_time(
 	_In_ uint64_t file_time_int,
@@ -116,9 +190,28 @@ int_to_file_time(
 	_ASSERTE(nullptr != file_time);
 	if (nullptr == file_time) return;
 
-	file_time->dwLowDateTime = ((PLARGE_INTEGER)&file_time_int)->LowPart;
-	file_time->dwHighDateTime = ((PLARGE_INTEGER)&file_time_int)->HighPart;
+	large_int_to_file_time(reinterpret_cast<PLARGE_INTEGER>(&file_time_int), file_time);
 }
+
+/// @brief	LARGE_INTEGER -> FILETIME 으로 변환
+///			** NOTE **
+///			특별한 경우가 아니라면 large_int_to_file_time() 함수를 사용할 필요없이 
+///			`PFILETIME ft = (PFILETIME)&large_int` 형태로 바로 캐스팅해서 사용하도 문제없다. 
+///			
+__inline 
+void
+large_int_to_file_time(
+	_In_ const PLARGE_INTEGER large_int,
+	_Out_ PFILETIME const file_time
+)
+{
+	_ASSERTE(nullptr != large_int);
+	if (nullptr == large_int) return;
+
+	file_time->dwLowDateTime = large_int->LowPart;
+	file_time->dwHighDateTime = large_int->HighPart;
+}
+
 /// @brief	unixtime(DWORD) -> FILETIME
 ///	@remark	Do not cast a pointer to a FILETIME structure to either a ULARGE_INTEGER* or __int64*
 ///			https://msdn.microsoft.com/en-us/library/ms724284(VS.85).aspx
@@ -2160,6 +2253,162 @@ SaveBinaryFile(
 	return true;
 }
 
+/// @brief	파일의 해시를 계산한다.
+bool
+get_file_hash_by_filepath(
+	_In_ const wchar_t* file_path,
+	_Out_opt_ const std::string* md5,
+	_Out_opt_ const std::string* sha2
+)
+{
+	_ASSERTE(nullptr != file_path);
+	_ASSERTE(!(nullptr == md5 && nullptr == sha2));
+	if (nullptr == file_path || (nullptr == md5 && nullptr == sha2))
+	{
+		return false;
+	}
+
+	handle_ptr file_handle(
+		CreateFileW(file_path,
+					GENERIC_READ,
+					FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+					NULL,
+					OPEN_EXISTING,
+					FILE_ATTRIBUTE_NORMAL,
+					NULL),
+		[](HANDLE h)
+	{
+		if (INVALID_HANDLE_VALUE != h)
+		{
+			CloseHandle(h);
+		}
+	});
+
+	if (INVALID_HANDLE_VALUE == file_handle.get())
+	{
+		log_err
+			"CreateFileW() failed. path=%ws, gle = %u",
+			file_path,
+			GetLastError()
+			log_end;
+		return false;
+	}
+
+	return get_file_hash_by_filehandle(file_handle.get(),
+									   md5,
+									   sha2);
+}
+
+
+/// @brief	파일의 해시를 계산한다.
+bool
+get_file_hash_by_filehandle(
+	_In_ HANDLE file_handle,
+	_Out_opt_ const std::string* md5,
+	_Out_opt_ const std::string* sha2
+)
+{
+	_ASSERTE(nullptr != file_handle);
+	_ASSERTE(!(nullptr == md5 && nullptr == sha2));
+	if (nullptr == file_handle || (nullptr == md5 && nullptr == sha2))
+	{
+		return false;
+	}
+	
+	bool ret = false;
+	MD5_CTX* ctx_md5 = nullptr;
+	sha256_ctx* ctx_sha2 = nullptr;
+	uint8_t* sha2_buf = nullptr;
+	do
+	{
+		if (nullptr != md5)
+		{
+			ctx_md5 = (MD5_CTX*)malloc(sizeof(MD5_CTX));
+			if (nullptr == ctx_md5) break;
+		}
+
+		if (nullptr != sha2)
+		{
+			ctx_sha2 = (sha256_ctx*)malloc(sizeof(sha256_ctx));
+			sha2_buf = (uint8_t*)malloc(32);
+			if (nullptr == ctx_sha2 || nullptr == sha2_buf) break;
+		}
+		
+		_ASSERTE(!(nullptr == ctx_md5 && nullptr == ctx_sha2));
+
+		/// NOTE by somma
+		/// ReadFile() 로 읽어서 해시를 구하던 코드를 FileIoHelper 를 사용해서
+		/// MMIO 로 변경했으나 성능상의 큰 이득은 없는것 같다. 
+		/// 어차피 실행 파일 사이즈가 작아서 크게 이득은 없을 듯 싶다.
+		FileIoHelper fio;
+		if (true != fio.OpenForRead(file_handle))
+		{
+			log_err "fio.OpenForRead() failed. file handle=0x%p",
+				file_handle
+				log_end;
+			break;
+		}
+
+		if (nullptr != ctx_md5) { MD5Init(ctx_md5, 0); }
+		if (nullptr != ctx_sha2) { sha256_begin(ctx_sha2); }
+
+		bool err = false;
+		uint64_t file_size = fio.FileSize();
+		uint64_t pos = 0;
+		while (pos < file_size)
+		{
+			if (err) break;
+
+			uint32_t size = (uint32_t)min(fio.GetOptimizedBlockSize(), file_size - pos);
+			uint8_t* ptr = fio.GetFilePointer(true, pos, size);
+
+			if (nullptr != ctx_md5) { MD5Update(ctx_md5, ptr, size); }
+			if (nullptr != ctx_sha2) { sha256_hash(ptr, size, ctx_sha2); }
+
+			fio.ReleaseFilePointer();
+			pos += size;
+		}
+
+		if (nullptr != ctx_md5) { MD5Final(ctx_md5); }
+		if (nullptr != ctx_sha2){ sha256_end(sha2_buf, ctx_sha2); }
+
+		//
+		//	Hash 바이너리 버퍼를 hex 문자열로 변환
+		//
+		std::string tmp;
+		if (nullptr != ctx_md5)
+		{
+			if (true != bin_to_hexa_fast(sizeof(ctx_md5->digest),
+										 ctx_md5->digest,
+										 false,
+										 (std::string&)*md5))
+			{
+				log_err "bin_to_hexa_fast() failed. " log_end;
+				break;
+			}			
+		}
+		
+		if (nullptr != ctx_sha2)
+		{
+			if (true != bin_to_hexa_fast(32,
+										 sha2_buf,
+										 false,
+										 (std::string&)*sha2))
+			{
+				log_err "bin_to_hexa_fast() failed. " log_end;
+				break;
+			}
+		}		
+
+		ret = true;
+	} while (false);
+
+	free_and_nil(ctx_md5);
+	free_and_nil(ctx_sha2);
+	free_and_nil(sha2_buf);
+	return ret;
+}
+
 
 /// @brief	DirectoryPath 디렉토리를 생성한다. 
 ///			중간에 없는 디렉토리 경로가 존재하면 생성한다.
@@ -2560,53 +2809,37 @@ bool get_system_dir(_Out_ std::wstring& system_dir)
 **/
 bool get_windows_dir(_Out_ std::wstring& windows_dir)
 {
-	wchar_t     buf[MAX_PATH] = { 0x00 };
-	uint32_t    buf_len = sizeof(buf);
-	wchar_t*    pbuf = buf;
-
-	UINT32 len = GetWindowsDirectoryW(pbuf, buf_len);
-	if (0 == len)
+	//
+	//	터미널서비스가 동작중인 경우 각 터미널 서비스 사용자는 개별 
+	//	Windows 디렉토리를 가진다. 
+	//	GetWindowsDirectory() 함수는 개별 windows 디렉토리를 리턴하고
+	//	GetSystemWindowsDirectory() 함수는 전역 windows 디렉토리르리턴한다.
+	//
+	uint32_t cc_buf = GetSystemWindowsDirectoryW(nullptr, 0);
+	if (0 == cc_buf)
 	{
-		log_err "GetWindowsDirectoryW() failed. gle=%u", GetLastError() log_end;
+		log_err 
+			"GetSystemWindowsDirectoryW() failed. gle=%u", 
+			GetLastError() 
+			log_end;
 		return false;
 	}
 
-	if (len < buf_len)
+	auto buffer = std::make_unique<wchar_t[]>(cc_buf + 1);
+	cc_buf = GetSystemWindowsDirectoryW(buffer.get(), cc_buf);
+	if (0 == cc_buf)
 	{
-		buf[len] = 0x0000;
-		windows_dir = buf;
+		log_err 
+			"GetSystemWindowsDirectoryW() failed. gle=%u", 
+			GetLastError() 
+			log_end;
+		return false;
+	}
+	else
+	{
+		windows_dir = buffer.get();
 		return true;
 	}
-	else if (len == buf_len)
-	{
-		// GetWindowsDirectoryW( ) 는 null char 를 포함하지 않는 길이를 리턴함
-		// 버퍼가 더 필요하다.
-		buf_len *= 2;
-		pbuf = (wchar_t*)malloc(buf_len);
-		if (NULL == buf)
-		{
-			log_err "not enough memory" log_end;
-			return false;
-		}
-
-		// try again
-		len = GetSystemDirectoryW(pbuf, buf_len);
-		if (0 == len)
-		{
-			log_err "GetSystemDirectoryW() failed. gle=%u", GetLastError() log_end;
-			free(pbuf);
-			return false;
-		}
-		else
-		{
-			pbuf[len] = 0x0000;
-			windows_dir = pbuf;
-			free(pbuf); pbuf = NULL;
-			return true;
-		}
-	}
-
-	return true;        // never reach here
 }
 
 /**
@@ -2739,9 +2972,9 @@ bool get_short_file_name(_In_ const wchar_t* long_file_name, _Out_ std::wstring&
 bool
 find_files(
 	_In_ const wchar_t* root,
-	_In_ fnFindFilesCallback cb,
 	_In_ DWORD_PTR tag,
-	_In_ bool recursive
+	_In_ bool recursive,
+	_In_ fnFindFilesCallback cb
 )
 {
 	_ASSERTE(NULL != root);
@@ -2787,15 +3020,23 @@ find_files(
 	{
 		DWORD gle = GetLastError();
 
-		if (ERROR_ACCESS_DENIED != gle)
+		if (ERROR_ACCESS_DENIED == gle || ERROR_FILE_NOT_FOUND == gle)
+		{
+			//
+			// 매칭되는 파일이 없거나(* 를 사용한 find_files() 호출의 경우)
+			// 권한이 부족한 경우 
+			// 성공으로 간주한다. 
+			// 
+			return true;
+		}
+		else
 		{
 			log_err
 				"FindFirstFileW(path=%S) failed, gle=%u",
 				root_dir.c_str(), GetLastError()
-				log_end
+				log_end;
+			return false;
 		}
-
-		return false;
 	}
 
 	_wsplitpath_s(root_dir.c_str(), drive, _MAX_DRIVE, dir, MAX_PATH, NULL, NULL, NULL, NULL);
@@ -2821,7 +3062,7 @@ find_files(
 				if (0 != _wcsnicmp(&wfd.cFileName[0], L".", 1))
 				{
 					StringCbPrintfW(newpath, sizeof(newpath), L"%s%s%s\\*.*", drive, dir, wfd.cFileName);
-					find_files(newpath, cb, tag, recursive);
+					find_files(newpath, tag, recursive, cb);
 				}
 			}
 		}
@@ -3306,6 +3547,30 @@ lstrnicmpa(
 	}
 }
 
+/// 두 문자열이 완전히 일치하는지 확인한다. 
+bool 
+is_same_string(
+	_In_ const wchar_t* lhs,
+	_In_ const wchar_t* rhs,
+	_In_ bool case_insensitive
+)
+{
+	_ASSERTE(nullptr != lhs);
+	_ASSERTE(nullptr != rhs);
+	if (nullptr == lhs || nullptr == rhs) return false;
+
+	size_t len = max(wcslen(lhs), wcslen(rhs));
+	if (true == case_insensitive)
+	{
+		return (0 == _wcsnicmp(lhs, rhs, len)) ? true : false;
+	}
+	else
+	{
+		return (0 == wcsncmp(lhs, rhs, len)) ? true : false;
+	}
+}
+
+
 /**
  * \brief	org_string 에서 token 을 검색해서 문자열을 잘라낸다.
 			(org_string 의 앞에서부터 token 을 검색)
@@ -3678,7 +3943,12 @@ get_file_extensionw(
 	_ASSERTE(nullptr != file_path);
 	if (nullptr == file_path) return false;
 
-	std::wstring org_string(file_path);
+	//
+	// c:\dbg\.\sub\abc_no_ext 형태의 경로명인 경우 `\sub\abc_no_ext` 가 
+	// 확장자로 인식된다. 따라서 뒤에서 `\` 문자열을 먼저 찾은 후 `\` 이후 
+	// 문자열에서 `.` 를 찾는다.
+	//
+	std::wstring org_string = extract_last_tokenExW(file_path, L"\\", false);
 	size_t pos = org_string.rfind(L".");
 	if (std::wstring::npos == pos)
 	{
@@ -5246,6 +5516,137 @@ bool	process_in_console_session(_In_ DWORD process_id)
 	}
 }
 
+/// @brief	cmdline 을 실행하는 프로세스를 생성하는 CreateProcessW 함수 wrapper
+bool 
+create_process(
+	_In_z_ const wchar_t* cmdline,
+	_In_ DWORD creation_flag,
+	_In_opt_z_ const wchar_t* current_dir,
+	_Out_ HANDLE& process_handle,
+	_Out_ DWORD& process_id)
+{
+	_ASSERTE(nullptr != cmdline);
+	if (nullptr == cmdline) return false;
+
+	// CreateProcessW 함수는 cmdline 이 쓰기 가능한 버퍼이어야 한다. 
+	// 따라서 입력으로 받은 cmdline 을 위한 버퍼를 할당하고, 복사해서
+	// 사용한다.
+	size_t buf_size = ((wcslen(cmdline) + 1) * sizeof(wchar_t));
+	wchar_ptr cmdline_buf((wchar_t*)malloc(buf_size), [](wchar_t* p)
+	{
+		if (nullptr != p) free(p);
+	});
+
+	if (!cmdline_buf)
+	{
+		log_err "No memory for cmdline. size=%u",
+			buf_size
+			log_end;
+		return false;
+	}		
+	RtlCopyMemory(cmdline_buf.get(), cmdline, wcslen(cmdline) * sizeof(wchar_t));
+	cmdline_buf.get()[wcslen(cmdline)] = 0x0000;
+	
+	PROCESS_INFORMATION pi = { 0 };
+	STARTUPINFOW si = { 0 };
+	si.cb = sizeof(si);
+
+	if (!CreateProcessW(nullptr,
+						cmdline_buf.get(),
+						nullptr,
+						nullptr,
+						FALSE,
+						creation_flag,
+						nullptr,
+						nullptr != current_dir ? current_dir : nullptr,
+						&si,
+						&pi))
+	{
+		log_err "CreateProcessW() failed. cmd=%ws, gle=%u",
+			cmdline_buf.get(),
+			GetLastError()
+			log_end;
+		return false;
+	}
+
+	process_handle = pi.hProcess;
+	process_id = pi.dwProcessId;
+
+	CloseHandle(pi.hThread);
+	return true;
+}
+
+/// @brief	프로세스를 생성하고, 종료시까지 기다린다. 
+bool 
+create_process_and_wait(
+	_In_ const wchar_t* cmdline,
+	_In_ DWORD creation_flag,
+	_In_opt_z_ const wchar_t* current_dir,
+	_In_ DWORD timeout_secs,
+	_Out_ DWORD& exit_code
+)
+{
+	HANDLE process_handle;
+	DWORD process_id;
+
+	if (!create_process(cmdline, creation_flag, current_dir, process_handle, process_id))
+	{
+		log_err "create_process() failed. cmdline=%ws", cmdline log_end;
+		return false;
+	}
+
+	//
+	//	Wait for the process
+	//
+	DWORD wr = WaitForSingleObject(process_handle, timeout_secs*1000);
+	if (WAIT_OBJECT_0 != wr)
+	{
+		switch (wr)
+		{
+		case WAIT_ABANDONED:
+			log_err 
+				"WaitForSingleObject() failed for process. pid=%u, handle=0x%p, wr=WAIT_ABANDONED", 
+				process_id, 
+				process_handle
+				log_end;
+			break;
+		case WAIT_TIMEOUT:
+			log_err "WaitForSingleObject() failed for process. pid=%u, handle=0x%p, wr=WAIT_TIMEOUT",
+				process_id,
+				process_handle
+				log_end;
+			break;
+		case WAIT_FAILED:
+			log_err "WaitForSingleObject() failed for process. pid=%u, handle=0x%p, wr=WAIT_FAILED, gle=%u",
+				process_id,
+				process_handle, 
+				GetLastError()
+				log_end;
+			break;
+		default:
+			_ASSERTE(!"oops! Unknown wait result code.");
+		}
+
+		//
+		//	어찌되었거나 생성된 프로세스가 정상종료되었다는 보장이 없으므로
+		//	강제 종료 시도한다. 
+		//
+		TerminateProcess(process_handle, 0xffffffff);
+	}
+
+	if (!GetExitCodeProcess(process_handle, &exit_code))
+	{
+		log_err "GetExitCodeProcess() failed. gle=%u", GetLastError() log_end;
+		exit_code = 0xffffffff;		// exit_code -1 로 간주
+	}
+
+	//
+	//	Cleanup
+	//
+	CloseHandle(process_handle);
+	return true;
+}
+
 /// @brief	active console session 에 로그인된 사용자 계정으로 프로세스를 생성한다.
 ///	@remark 이건 여러모로 위험한 함수이므로 쓰지말자. 
 bool
@@ -6433,7 +6834,7 @@ psid_info get_sid_info(_In_ PSID sid)
 		case ERROR_INVALID_SID: gles = "ERROR_INVALID_SID"; break;
 		case ERROR_INVALID_PARAMETER: gles = "ERROR_INVALID_PARAMETER"; break;
 		}
-
+		
 		if (nullptr != gles)
 		{
 			log_err "ConvertSidToStringSidW() failed. gle=%s",
@@ -7778,33 +8179,37 @@ IMAGE_TYPE get_image_type(_In_ HANDLE file_handle)
 			return IT_UNKNOWN;
 		}
 
-		// check DOS file size
+		//
+		//	PE 상에 기록된 PE 파일의 사이즈와 실제 파일 사이즈를 비교
 		// 
 		DWORD dosSize = (idh->e_cp * 512);
 		if (dosSize > fileSize.QuadPart)
 		{
-			log_err "invalid file size, size=%llu",
-				fileSize.QuadPart
-				log_end;
-
-			//
-			//	Not a PE file
-			//
+			log_dbg "(not a pe) invalid file size, size=%llu", fileSize.QuadPart log_end;
 			return IT_UNKNOWN;
 		}
 
-		PIMAGE_NT_HEADERS inh = (PIMAGE_NT_HEADERS)((DWORD_PTR)idh + idh->e_lfanew);
-		if ((uintptr_t)inh >= (((uintptr_t)idh) + fileSize.QuadPart))
+		//
+		//	IMAGE_NT_HEADER 포인터가 PE 파일 영역(+/- 방향 모두)에 있는지 확인
+		//
+		#define IMAGE_DOS_SIGNATURE_SIZE 2
+		PIMAGE_NT_HEADERS inh = (PIMAGE_NT_HEADERS)((uintptr_t)idh + idh->e_lfanew);
+		if ((uintptr_t)inh < ((uintptr_t)idh + IMAGE_DOS_SIGNATURE_SIZE))
 		{
-			log_err "invalid file size (e_lfanew). file_size=%llu, inh addr=0x%p",
-				fileSize.QuadPart,
-				inh
-				log_end;
-			//
-			//	Not a PE file
-			//
+			log_dbg "(not a pe) invalid idh->e_lfanew (negative value)" log_end;
 			return IT_UNKNOWN;
 		}
+		
+		//
+		//	IMAGE_NT_HEADER 구조체가 PE 파일 범이내에 모두 있는지 확인
+		//
+		if ( (uintptr_t)inh > (uintptr_t)idh + fileSize.QuadPart ||			
+			 (uintptr_t)inh + sizeof(IMAGE_NT_HEADERS) > (uintptr_t)idh + fileSize.QuadPart )
+		{
+			log_dbg "(not a pe) inh is out of pe file." log_end;
+			return IT_UNKNOWN;
+		}
+
 		if (IMAGE_NT_SIGNATURE != inh->Signature) return IT_UNKNOWN;;
 
 		WORD subsys = inh->OptionalHeader.Subsystem;
@@ -8163,40 +8568,6 @@ bool wstr_to_uint64(_In_ const wchar_t* uint64_string, _Out_ uint64_t& uint64_va
 }
 
 /**
- * @brief
- * @param
- * @see
- * @remarks
- * @code
- * @endcode
- * @return
-**/
-UINT16 swap_endian_16(_In_ UINT16 value)
-{
-	return (value >> 8) | (value << 8);
-}
-
-UINT32 swap_endian_32(_In_ UINT32 value)
-{
-	return	(value >> 24) |
-		((value << 8) & 0x00FF0000) |
-		((value >> 8) & 0x0000FF00) |
-		(value << 24);
-}
-
-UINT64 swap_endian_64(_In_ UINT64 value)
-{
-	return  (value >> 56) |
-		((value << 40) & 0x00FF000000000000) |
-		((value << 24) & 0x0000FF0000000000) |
-		((value << 8) & 0x000000FF00000000) |
-		((value >> 8) & 0x00000000FF000000) |
-		((value >> 24) & 0x0000000000FF0000) |
-		((value >> 40) & 0x000000000000FF00) |
-		(value << 56);
-}
-
-/**
 * @brief	cpu 정보를 수집한다.
 * @param
 * @see
@@ -8349,7 +8720,7 @@ const wchar_t*  osver_to_str(_In_ OSVER os)
 }
 
 /// @brief  RtlGetVersion() wrapper
-///			https://msdn.microsoft.com/en-us/library/windows/desktop/ms724832(v=vs.85).aspx
+///			https://docs.microsoft.com/ko-kr/windows-hardware/drivers/ddi/content/wdm/ns-wdm-_osversioninfoexw
 OSVER get_os_version()
 {
 	OSVER os = OSV_UNKNOWN;
